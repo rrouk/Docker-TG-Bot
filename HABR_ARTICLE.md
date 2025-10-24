@@ -100,7 +100,7 @@ ALLOWED_USERS=123456789,987654321
 - Уведомления о событиях
 
 **Полезные ссылки:**
-- [python-telegram-bot](https://github.com/rrouk/python-telegram-bot/)
+- [python-telegram-bot](https://github.com/rrouk/Docker-TG-Bot/)
 - [Docker CLI Reference](https://docs.docker.com/engine/reference/commandline/cli/)
 
 Удачи в автоматизации! 🚀
