@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  telegram-docker-bot:
+    build: .
+    container_name: telegram-docker-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./logs:/app/logs
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
