@@ -89,7 +89,7 @@ volumes:
 1. Узнайте свой Telegram ID (отправьте `/start` боту [@userinfobot](https://t.me/userinfobot))
 2. Добавьте в `.env`:
 ```env
-ALLOWED_USERS=123456789,987654321
+ALLOWED_USERS=id_1,id_n
 ```
 
 ## Заключение
