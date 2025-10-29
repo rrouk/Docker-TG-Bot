@@ -1,19 +1,19 @@
 version: '3.8'
 
 services:
-  telegram-docker-bot:
+  dockerbot:
     build: .
-    container_name: telegram-docker-bot
+    container_name: docker-bot
     restart: unless-stopped
     env_file:
       - .env
 
     volumes:
+      # Монтирование Docker Socket для управления контейнерами (требует RW)
       - /var/run/docker.sock:/var/run/docker.sock
+      
+      # Монтирование папки для логов (требует RW)
       - ./logs:/app/logs
-    networks:
-      - bot-network
-
-networks:
-  bot-network:
-    driver: bridge
+      
+      # !!! КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Добавление :ro для режима только для чтения
+      - E:\Docker:/app/data_to_archive:ro

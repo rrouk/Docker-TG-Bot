@@ -1,12 +1,23 @@
+# -*- coding: utf-8 -*-
 import os
 import asyncio
 import docker
-import html # Импорт модуля html для экранирования
+import html
+import shutil 
+from datetime import datetime, timezone 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from dotenv import load_dotenv
-import datetime
-from datetime import timezone 
+from typing import Optional # Добавлен для Optional
+
+# ИМПОРТИРУЙТЕ ВАШУ ЛОГИКУ ШИФРОВАНИЯ
+# Убедитесь, что файл cipher_logic.py находится в той же папке
+try:
+    from cipher_logic import AESGCMCipher
+except ImportError:
+    print("❌ Ошибка: Не найден модуль cipher_logic.py. Функции шифрования не будут работать.")
+    AESGCMCipher = None
+
 
 load_dotenv()
 
@@ -15,7 +26,24 @@ class DockerBot:
         self.bot_token = os.getenv('BOT_TOKEN')
         self.allowed_users = [int(user_id) for user_id in os.getenv('ALLOWED_USERS', '').split(',') if user_id]
         
+        # --- Настройки Шифрования из .env ---
+        self.enc_password = os.getenv("ENCRYPTION_PASSWORD")
+        self.iter_password = os.getenv("ITERATIONS_PASSWORD", "")
+        # Используем путь внутри контейнера, указанный в .env
+        self.folder_to_archive = os.getenv("FOLDER_TO_ARCHIVE") or "/app/data_to_archive"
+        
+        # ------------------------------------
+
+        if not self.enc_password:
+             print("⚠️ ВНИМАНИЕ: Пароль шифрования (ENCRYPTION_PASSWORD) не установлен в .env.")
+        
+        # Проверка и создание папки
+        if not os.path.isdir(self.folder_to_archive):
+            os.makedirs(self.folder_to_archive, exist_ok=True)
+            print(f"Папка {self.folder_to_archive} не найдена. Создана пустая папка.")
+
         try:
+            # Проверка, что Docker Socket смонтирован
             if not os.path.exists('/var/run/docker.sock'):
                 raise Exception("Docker socket не найден: /var/run/docker.sock")
 
@@ -25,95 +53,96 @@ class DockerBot:
         except Exception as e:
             print(f"Ошибка подключения к Docker: {e}")
             print("Убедитесь, что Docker socket смонтирован в контейнер")
-            raise
+            self.docker_client = None 
 
-    # --- Новая функция для экранирования системных данных ---
+    # --- Вспомогательные функции ---
+
     def _escape_html(self, text):
         """Экранирует специальные символы HTML для безопасного отображения"""
         return html.escape(str(text))
-    # --------------------------------------------------------
 
     def _format_uptime(self, started_at_str):
-        """
-        Calculates and formats the uptime from the ISO 8601 string returned by Docker.
-        """
-        if not started_at_str:
-            return "N/A"
-
+        if not started_at_str: return "N/A"
+        import datetime
         s = started_at_str
-
         try:
             s = s.replace('Z', '+00:00')
-            dot_index = s.find('.')
-            tz_index = s.find('+') 
-
+            dot_index = s.find('.'); tz_index = s.find('+') 
             if dot_index != -1 and tz_index != -1:
                 frac_len = tz_index - (dot_index + 1)
-                if frac_len > 6:
-                    s = s[:dot_index + 1 + 6] + s[tz_index:]
-                elif frac_len == 0:
-                    s = s[:dot_index] + s[tz_index:]
-
-            try:
-                started_at = datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f%z")
-            except ValueError:
-                started_at = datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z")
-
+                if frac_len > 6: s = s[:dot_index + 1 + 6] + s[tz_index:]
+                elif frac_len == 0: s = s[:dot_index] + s[tz_index:]
+            try: started_at = datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f%z")
+            except ValueError: started_at = datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z")
             now = datetime.datetime.now(timezone.utc)
             diff = now - started_at
             seconds = int(diff.total_seconds())
+            if seconds < 0: return "Unknown"
+            if seconds < 60: return f"{seconds} сек"
+            elif seconds < 3600: return f"{seconds // 60} мин"
+            elif seconds < 86400: return f"{seconds // 3600} ч {(seconds % 3600) // 60} мин"
+            else: return f"{seconds // 86400} д {(seconds % 86400) // 3600} ч"
+        except Exception as e: return f"Raw: {started_at_str}"
 
-            if seconds < 0:
-                return "Unknown"
+    async def create_archive_and_encrypt(self, folder_path: str, output_file: str) -> tuple[str, int]:
+        """Архивирует папку, шифрует архив и возвращает путь к зашифрованному файлу и итерации."""
+        if not AESGCMCipher:
+            raise Exception("Модуль шифрования (cipher_logic.py) не загружен.")
+        if not self.enc_password:
+             raise Exception("Пароль шифрования (ENCRYPTION_PASSWORD) не установлен.")
 
-            if seconds < 60:
-                return f"{seconds} сек"
-            elif seconds < 3600:
-                minutes = seconds // 60
-                return f"{minutes} мин"
-            elif seconds < 86400:
-                hours = seconds // 3600
-                minutes = (seconds % 3600) // 60
-                return f"{hours} ч {minutes} мин"
-            else:
-                days = seconds // 86400
-                hours = (seconds % 86400) // 3600
-                return f"{days} д {hours} ч"
+        current_dir = os.getcwd() 
+        temp_zip_path_base = os.path.join(current_dir, os.path.basename(folder_path))
+        
+        try:
+            shutil.make_archive(
+                base_name=temp_zip_path_base,
+                format='zip', 
+                root_dir=os.path.dirname(folder_path), 
+                base_dir=os.path.basename(folder_path)
+            )
+            temp_zip_path = temp_zip_path_base + ".zip"
         except Exception as e:
-            print(f"Error parsing Docker timestamp '{started_at_str}'. Error: {e}")
-            return f"Raw: {started_at_str}"
+            print(f"Ошибка архивирования: {e}")
+            raise
 
+        try:
+            with open(temp_zip_path, 'rb') as f:
+                archive_data = f.read()
+        finally:
+            if os.path.exists(temp_zip_path):
+                os.remove(temp_zip_path)
+
+        cipher = AESGCMCipher(self.enc_password, self.iter_password)
+        encrypted_data, iterations = cipher.encrypt(archive_data, iterations=None) 
+
+        with open(output_file, 'wb') as f:
+            f.write(encrypted_data)
+
+        return output_file, iterations
+
+    # --- Docker-функции (не изменены) ---
 
     async def get_containers(self):
-        """Retrieve a list of all containers, including uptime data."""
+        if not self.docker_client: return []
+        # ... (код get_containers)
         try:
             containers = self.docker_client.containers.list(all=True)
             result = []
             for container in containers:
-                if container.image.tags:
-                    image_tag = container.image.tags[0]
-                else:
-                    image_tag = container.image.short_id
-
+                if container.image.tags: image_tag = container.image.tags[0]
+                else: image_tag = container.image.short_id
                 started_at = None
-                try:
-                    started_at = container.attrs['State'].get('StartedAt')
-                except (KeyError, AttributeError):
-                    started_at = None
-
-                result.append({
-                    'name': container.name,
-                    'status': container.status,
-                    'image': image_tag,
-                    'started_at': started_at
-                })
+                try: started_at = container.attrs['State'].get('StartedAt')
+                except (KeyError, AttributeError): started_at = None
+                result.append({'name': container.name, 'status': container.status, 'image': image_tag, 'started_at': started_at})
             return result
         except Exception as e:
             print(f"Ошибка при получении контейнеров: {e}")
             return []
 
     async def start_container(self, container_name):
-        """Запустить контейнер"""
+        if not self.docker_client: return False
         try:
             container = self.docker_client.containers.get(container_name)
             container.start()
@@ -123,7 +152,7 @@ class DockerBot:
             return False
 
     async def stop_container(self, container_name):
-        """Остановить контейнер"""
+        if not self.docker_client: return False
         try:
             container = self.docker_client.containers.get(container_name)
             container.stop()
@@ -133,7 +162,7 @@ class DockerBot:
             return False
 
     async def restart_container(self, container_name):
-        """Перезапустить контейнер"""
+        if not self.docker_client: return False
         try:
             container = self.docker_client.containers.get(container_name)
             container.restart()
@@ -143,7 +172,7 @@ class DockerBot:
             return False
 
     async def get_container_logs(self, container_name, lines=20):
-        """Получить логи контейнера"""
+        if not self.docker_client: return "Docker клиент недоступен."
         try:
             container = self.docker_client.containers.get(container_name)
             logs = container.logs(tail=lines).decode('utf-8')
@@ -151,6 +180,8 @@ class DockerBot:
         except Exception as e:
             print(f"Ошибка при получении логов: {e}")
             return f"Ошибка при получении логов: {self._escape_html(e)}"
+
+    # --- Обработчики Telegram ---
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
@@ -161,10 +192,10 @@ class DockerBot:
 
         keyboard = [
             [InlineKeyboardButton("📋 Список контейнеров", callback_data="list")],
+            [InlineKeyboardButton("🔒 Зашифровать архив", callback_data="encrypt_archive")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # parse_mode='HTML'
         await update.message.reply_text(
             "🐳 <b>Docker Bot</b>\n\nВыберите действие:",
             reply_markup=reply_markup, parse_mode='HTML'
@@ -179,6 +210,8 @@ class DockerBot:
             await self.show_containers(query)
         elif query.data == "back":
             await self.start_menu(query)
+        elif query.data == "encrypt_archive": 
+             await self.handle_encrypt_archive(query, context)
         elif query.data.startswith("container_"):
             await self.show_container_info(query)
         elif query.data.startswith("action_"):
@@ -188,25 +221,83 @@ class DockerBot:
         """Показать главное меню"""
         keyboard = [
             [InlineKeyboardButton("📋 Список контейнеров", callback_data="list")],
+            [InlineKeyboardButton("🔒 Зашифровать архив", callback_data="encrypt_archive")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # parse_mode='HTML'
         await query.edit_message_text(
             "🐳 <b>Docker Bot</b>\n\nВыберите действие:",
             reply_markup=reply_markup, parse_mode='HTML'
         )
+    
+    async def handle_encrypt_archive(self, query, context: ContextTypes.DEFAULT_TYPE):
+        """Архивирует заданную папку, шифрует ее и отправляет в чат."""
+        
+        if not self.enc_password:
+            await query.edit_message_text("❌ Ошибка: Пароль шифрования (ENCRYPTION_PASSWORD) не задан в .env.", parse_mode='HTML')
+            return
+        
+        folder_display_name = self._escape_html(os.path.basename(self.folder_to_archive))
+        
+        message = await query.edit_message_text(
+            f"⏳ Начинаю архивацию и шифрование папки <code>{folder_display_name}</code>...", 
+            parse_mode='HTML'
+        )
 
+        output_filename = ""
+        encrypted_filepath = ""
+        try:
+            server_names_env = os.getenv("server_names_env")
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            output_filename = f"{server_names_env}-{timestamp}.zip.enc"
+            
+            encrypted_filepath, iterations = await self.create_archive_and_encrypt(
+                self.folder_to_archive, 
+                os.path.join(os.getcwd(), output_filename)
+            )
+
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=encrypted_filepath,
+                caption=(
+                    f"✅ <b>Архив зашифрован!</b>\n\n"
+                ),
+                parse_mode='HTML'
+            )
+            
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=message.message_id,
+                text=f"✅ Архив успешно зашифрован и отправлен.",
+                parse_mode='HTML'
+            )
+
+        except Exception as e:
+            error_message = self._escape_html(f"При архивации/шифровании: {e}")
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=message.message_id,
+                text=f"❌ **Критическая ошибка:**\n\n<code>{error_message}</code>",
+                parse_mode='HTML'
+            )
+        finally:
+            if encrypted_filepath and os.path.exists(encrypted_filepath):
+                os.remove(encrypted_filepath)
+
+        await self.start_menu(query)
+    
     async def show_containers(self, query):
         """Display the list of containers including status, image, and uptime."""
+        if not self.docker_client:
+            await query.edit_message_text("❌ Docker клиент недоступен для управления контейнерами.", parse_mode='HTML')
+            return await self.start_menu(query)
+
         containers = await self.get_containers()
 
         if not containers:
-            # parse_mode='HTML'
             await query.edit_message_text("📋 Контейнеры не найдены", parse_mode='HTML')
             return
 
-        # Замена * на <b>
         message = "📋 <b>Список контейнеров:</b>\n\n"
         keyboard = []
 
@@ -217,10 +308,8 @@ class DockerBot:
             status_emoji = "🟢" if status == 'running' else "🔴"
 
             uptime_str = "N/A"
-            if status == 'running' and started_at:
-                uptime_str = self._format_uptime(started_at)
+            if status == 'running' and started_at: uptime_str = self._format_uptime(started_at)
             
-            # Используем <code> для контейнера и image, чтобы избежать ошибок парсинга
             escaped_name = self._escape_html(container['name'])
             escaped_image = self._escape_html(container['image'])
             
@@ -229,7 +318,6 @@ class DockerBot:
             message += f"    Образ: {escaped_image}\n"
             message += f"    Время работы: {uptime_str}\n\n"
 
-            # Кнопки остаются прежними, так как они не используют разметку
             keyboard.append([
                 InlineKeyboardButton(
                     f"{'⏹️' if status == 'running' else '▶️'} {container['name']}",
@@ -237,33 +325,34 @@ class DockerBot:
                 )
             ])
 
+        # ⬇️ ИСПРАВЛЕНИЕ 2: Удалена кнопка "Зашифровать архив" из списка контейнеров
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back")])
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # parse_mode='HTML'
         await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='HTML')
 
-    async def show_container_info(self, query):
-        """Показать информацию о контейнере"""
-        try:
-            container_name = query.data.split("_", 1)[1]
-        except IndexError:
-            await query.edit_message_text("❌ Ошибка: Неверный формат данных для контейнера.", parse_mode='HTML')
-            return
+
+    async def show_container_info(self, query, container_name: Optional[str] = None):
+        """Показать информацию о контейнере."""
+        if not self.docker_client: return await self.start_menu(query)
+        
+        # ⬇️ ИСПРАВЛЕНИЕ 1 (часть 2): Парсим имя, если оно не было передано явно
+        if not container_name:
+            try: container_name = query.data.split("_", 1)[1]
+            except IndexError:
+                await query.edit_message_text("❌ Ошибка: Неверный формат данных для контейнера.", parse_mode='HTML')
+                return
 
         try:
             container = self.docker_client.containers.get(container_name)
             status = container.status
 
-            if container.image.tags:
-                image_tag = container.image.tags[0]
-            else:
-                image_tag = container.image.short_id
+            if container.image.tags: image_tag = container.image.tags[0]
+            else: image_tag = container.image.short_id
 
             escaped_name = self._escape_html(container_name)
             escaped_image = self._escape_html(image_tag)
             
-            # Замена * на <b> и ` на <code>
             message = f"🐳 <b>{escaped_name}</b>\n\n"
             message += f"Статус: {status}\n"
             message += f"Образ: <code>{escaped_image}</code>\n\n"
@@ -280,15 +369,17 @@ class DockerBot:
             keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="list")])
 
             reply_markup = InlineKeyboardMarkup(keyboard)
-            # parse_mode='HTML'
             await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='HTML')
         except docker.errors.NotFound:
              await query.edit_message_text(f"❌ Ошибка: Контейнер с именем <code>{self._escape_html(container_name)}</code> не найден.", parse_mode='HTML')
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка при получении информации о контейнере: {self._escape_html(e)}", parse_mode='HTML')
 
+
     async def handle_action(self, query):
         """Обработка действий с контейнерами"""
+        if not self.docker_client: return await self.start_menu(query)
+        
         data = query.data.split("_")
         action = data[1]
         container_name = "_".join(data[2:])
@@ -296,38 +387,37 @@ class DockerBot:
 
         if action == "start":
             success = await self.start_container(container_name)
-            if success:
-                await query.edit_message_text(f"✅ Контейнер <code>{escaped_name}</code> запущен", parse_mode='HTML')
-            else:
-                await query.edit_message_text(f"❌ Ошибка при запуске контейнера <code>{escaped_name}</code>", parse_mode='HTML')
+            if success: await query.edit_message_text(f"✅ Контейнер <code>{escaped_name}</code> запущен", parse_mode='HTML')
+            else: await query.edit_message_text(f"❌ Ошибка при запуске контейнера <code>{escaped_name}</code>", parse_mode='HTML')
         elif action == "stop":
             success = await self.stop_container(container_name)
-            if success:
-                await query.edit_message_text(f"⏹️ Контейнер <code>{escaped_name}</code> остановлен", parse_mode='HTML')
-            else:
-                await query.edit_message_text(f"❌ Ошибка при остановке контейнера <code>{escaped_name}</code>", parse_mode='HTML')
+            if success: await query.edit_message_text(f"⏹️ Контейнер <code>{escaped_name}</code> остановлен", parse_mode='HTML')
+            else: await query.edit_message_text(f"❌ Ошибка при остановке контейнера <code>{escaped_name}</code>", parse_mode='HTML')
         elif action == "restart":
             success = await self.restart_container(container_name)
-            if success:
-                await query.edit_message_text(f"🔄 Контейнер <code>{escaped_name}</code> перезапущен", parse_mode='HTML')
-            else:
-                await query.edit_message_text(f"❌ Ошибка при перезапуске контейнера <code>{escaped_name}</code>", parse_mode='HTML')
+            if success: await query.edit_message_text(f"🔄 Контейнер <code>{escaped_name}</code> перезапущен", parse_mode='HTML')
+            else: await query.edit_message_text(f"❌ Ошибка при перезапуске контейнера <code>{escaped_name}</code>", parse_mode='HTML')
         elif action == "logs":
             logs = await self.get_container_logs(container_name, 20)
             
-            if len(logs) > 3000:
-                logs = logs[-3000:] + "\n\n... (показаны последние 20 строк)"
+            if len(logs) > 3000: logs = logs[-3000:] + "\n\n... (показаны последние 20 строк)"
 
-            # Используем <pre> для логов и экранируем весь текст логов
             escaped_logs = self._escape_html(logs)
             message = f"📝 <b>Логи <code>{escaped_name}</code>:</b>\n\n<pre>{escaped_logs}</pre>"
             
+            # Кнопка "Назад" ведет обратно в меню контейнера
             keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data=f"container_{container_name}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            # parse_mode='HTML'
             await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='HTML')
-
+        
+        # ⬇️ ИСПРАВЛЕНИЕ 1 (часть 1): Возвращаемся в меню контейнера после управления
+        if action in ["start", "stop", "restart"]:
+            await asyncio.sleep(1) # Ждем, пока Docker обновит статус
+            # Вызываем show_container_info с именем контейнера
+            await self.show_container_info(query, container_name)
+        
+        # ВНИМАНИЕ: Старый код, вызывающий self.start_menu(query), удален.
 
     def run(self):
         """Запуск бота"""
